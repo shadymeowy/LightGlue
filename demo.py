@@ -23,12 +23,12 @@ with torch.no_grad():
         nms_radius=4,
         detection_threshold=0.0005
     )
-    if not os.path.exists('weights/superpoint.st'):
+    if not os.path.exists('weights/superpoint.safetensor'):
         print("Converting superpoint to safetensors")
         extractor.load_state_dict(torch.load("weights/superpoint_v1.pth"))
-        save_model(extractor, 'weights/superpoint.st')
+        save_model(extractor, 'weights/superpoint.safetensor')
     else:
-        load_model(extractor, 'weights/superpoint.st')
+        load_model(extractor, 'weights/superpoint.safetensor')
     extractor = extractor.to(device).eval()
 
     matcher = LightGlue(
@@ -39,13 +39,13 @@ with torch.no_grad():
         width_confidence=-1,
         filter_threshold=0.1
     )
-    if not os.path.exists('weights/lightglue.st'):
+    if not os.path.exists('weights/lightglue.safetensor'):
         print("Converting lightglue to safetensors")
         matcher.load_state_dict(torch.load(
             "weights/superpoint_lightglue.pth"), strict=False)
-        save_model(matcher, 'weights/lightglue.st')
+        save_model(matcher, 'weights/lightglue.safetensor')
     else:
-        load_model(matcher, 'weights/lightglue.st', strict=False)
+        load_model(matcher, 'weights/lightglue.safetensor', strict=False)
     matcher = matcher.to(device).eval()
 
     image0 = cv2.imread("assets/sacre_coeur1.jpg")
