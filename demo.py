@@ -36,7 +36,7 @@ with torch.no_grad():
         flash=False,
         mp=False,
         depth_confidence=-1,
-        width_confidence=0.99,
+        width_confidence=-1,
         filter_threshold=0.1
     )
     if not os.path.exists('weights/lightglue.st'):
@@ -45,7 +45,7 @@ with torch.no_grad():
             "weights/superpoint_lightglue.pth"), strict=False)
         save_model(matcher, 'weights/lightglue.st')
     else:
-        load_model(matcher, 'weights/lightglue.st')
+        load_model(matcher, 'weights/lightglue.st', strict=False)
     matcher = matcher.to(device).eval()
 
     image0 = cv2.imread("assets/sacre_coeur1.jpg")
