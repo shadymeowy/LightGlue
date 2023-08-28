@@ -42,9 +42,16 @@
 
 # Adapted by Remi Pautrat, Philipp Lindenberger
 
+import numpy as np
 import torch
 from torch import nn
-from .utils import ImagePreprocessor
+from typing import NamedTuple
+
+
+class ExtractionResult(NamedTuple):
+    keypoints: torch.Tensor
+    scores: torch.Tensor
+    descriptors: torch.Tensor
 
 
 def simple_nms(scores, nms_radius: int):
@@ -65,6 +72,18 @@ def simple_nms(scores, nms_radius: int):
     return torch.where(max_mask, scores, zeros)
 
 
+@torch.jit.script
+def to_gray(image):
+    if image.shape[1] == 3:  # RGB
+        scale = torch.tensor([0.299, 0.587, 0.114]).to(image).view(1, 3, 1, 1)
+        image = (image*scale).sum(1, keepdim=True)
+    elif image.shape[1] == 4:  # RGBA
+        scale = torch.tensor([0.299, 0.587, 0.114, 0.0]
+                             ).to(image).view(1, 4, 1, 1)
+        image = (image*scale).sum(1, keepdim=True)
+    return image
+
+
 def top_k_keypoints(keypoints, scores, k):
     if k >= len(keypoints):
         return keypoints, scores
@@ -76,8 +95,8 @@ def sample_descriptors(keypoints, descriptors, s: int = 8):
     """ Interpolate descriptors at keypoint locations """
     b, c, h, w = descriptors.shape
     keypoints = keypoints - s / 2 + 0.5
-    keypoints /= torch.tensor([(w*s - s/2 - 0.5), (h*s - s/2 - 0.5)],
-                              ).to(keypoints)[None]
+    keypoints[..., 0] /= w*s - s/2 - 0.5
+    keypoints[..., 1] /= h*s - s/2 - 0.5
     keypoints = keypoints*2 - 1  # normalize to (-1, 1)
     args = {'align_corners': True} if torch.__version__ >= '1.3' else {}
     descriptors = torch.nn.functional.grid_sample(
@@ -101,12 +120,6 @@ class SuperPoint(nn.Module):
         'max_num_keypoints': None,
         'detection_threshold': 0.0005,
         'remove_borders': 4,
-    }
-
-    preprocess_conf = {
-        **ImagePreprocessor.default_conf,
-        'resize': 1024,
-        'grayscale': True,
     }
 
     required_data_keys = ['image']
@@ -136,21 +149,15 @@ class SuperPoint(nn.Module):
             c5, self.conf['descriptor_dim'],
             kernel_size=1, stride=1, padding=0)
 
-        url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
-        self.load_state_dict(torch.hub.load_state_dict_from_url(url))
+        # url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
+        # self.load_state_dict(torch.hub.load_state_dict_from_url(url))
 
         mk = self.conf['max_num_keypoints']
         if mk is not None and mk <= 0:
             raise ValueError('max_num_keypoints must be positive or None')
 
-    def forward(self, data: dict) -> dict:
-        """ Compute keypoints, scores, descriptors for image """
-        for key in self.required_data_keys:
-            assert key in data, f'Missing key {key} in data'
-        image = data['image']
-        if image.shape[1] == 3:  # RGB
-            scale = image.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
-            image = (image*scale).sum(1, keepdim=True)
+    def forward(self, image) -> dict:
+        image = to_gray(image)
         # Shared Encoder
         x = self.relu(self.conv1a(image))
         x = self.relu(self.conv1b(x))
@@ -208,21 +215,8 @@ class SuperPoint(nn.Module):
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                        for k, d in zip(keypoints, descriptors)]
 
-        return {
-            'keypoints': torch.stack(keypoints, 0),
-            'keypoint_scores': torch.stack(scores, 0),
-            'descriptors': torch.stack(descriptors, 0).transpose(-1, -2),
-        }
-
-    def extract(self, img: torch.Tensor, **conf) -> dict:
-        """ Perform extraction with online resizing"""
-        if img.dim() == 3:
-            img = img[None]  # add batch dim
-        assert img.dim() == 4 and img.shape[0] == 1
-        shape = img.shape[-2:][::-1]
-        img, scales = ImagePreprocessor(
-            **{**self.preprocess_conf, **conf})(img)
-        feats = self.forward({'image': img})
-        feats['image_size'] = torch.tensor(shape)[None].to(img).float()
-        feats['keypoints'] = (feats['keypoints'] + .5) / scales[None] - .5
-        return feats
+        return ExtractionResult(
+            torch.stack(keypoints, 0),
+            torch.stack(scores, 0),
+            torch.stack(descriptors, 0).transpose(-1, -2),
+        )

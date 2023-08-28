@@ -6,6 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from typing import Optional, List, Callable
+from typing import NamedTuple
 
 try:
     from flash_attn.modules.mha import FlashCrossAttention
@@ -17,7 +18,14 @@ if FlashCrossAttention or hasattr(F, 'scaled_dot_product_attention'):
 else:
     FLASH_AVAILABLE = False
 
-torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.deterministic = True
+
+
+class MatchingResult(NamedTuple):
+    mkpts0: torch.Tensor
+    mkpts1: torch.Tensor
+    matches: torch.Tensor
+    matching_scores: torch.Tensor
 
 
 @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
@@ -184,7 +192,8 @@ class CrossTransformer(nn.Module):
             attn01 = F.softmax(sim, dim=-1)
             attn10 = F.softmax(sim.transpose(-2, -1).contiguous(), dim=-1)
             m0 = torch.einsum('bhij, bhjd -> bhid', attn01, v1)
-            m1 = torch.einsum('bhji, bhjd -> bhid', attn10.transpose(-2, -1), v0)
+            m1 = torch.einsum('bhji, bhjd -> bhid',
+                              attn10.transpose(-2, -1), v0)
         m0, m1 = self.map_(lambda t: t.transpose(1, 2).flatten(start_dim=-2),
                            m0, m1)
         m0, m1 = self.map_(self.to_out, m0, m1)
@@ -269,6 +278,7 @@ class LightGlue(nn.Module):
         'weights': None,
     }
 
+
     required_data_keys = [
         'image0', 'image1']
 
@@ -280,13 +290,9 @@ class LightGlue(nn.Module):
         'disk': ('disk_lightglue', 128)
     }
 
-    def __init__(self, features='superpoint', **conf) -> None:
+    def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = {**self.default_conf, **conf}
-        if features is not None:
-            assert (features in list(self.features.keys()))
-            self.conf['weights'], self.conf['input_dim'] = \
-                self.features[features]
         self.conf = conf = SimpleNamespace(**self.conf)
 
         if conf.input_dim != conf.descriptor_dim:
@@ -308,18 +314,7 @@ class LightGlue(nn.Module):
         self.token_confidence = nn.ModuleList([
             TokenConfidence(d) for _ in range(n-1)])
 
-        if features is not None:
-            fname = f'{conf.weights}_{self.version}.pth'.replace('.', '-')
-            state_dict = torch.hub.load_state_dict_from_url(
-                self.url.format(self.version, features), file_name=fname)
-            self.load_state_dict(state_dict, strict=False)
-        elif conf.weights is not None:
-            path = Path(__file__).parent
-            path = path / 'weights/{}.pth'.format(self.conf.weights)
-            state_dict = torch.load(str(path), map_location='cpu')
-            self.load_state_dict(state_dict, strict=False)
-
-    def forward(self, data: dict) -> dict:
+    def forward(self, size0, size1, kpts0_, kpts1_, desc0, desc1) -> tuple:
         """
         Match keypoints and descriptors between two images
 
@@ -341,26 +336,19 @@ class LightGlue(nn.Module):
             matches: List[[Si x 2]], scores: List[[Si]]
         """
         with torch.autocast(enabled=self.conf.mp, device_type='cuda'):
-            return self._forward(data)
+            return self._forward(size0, size1, kpts0_, kpts1_, desc0, desc1)
 
-    def _forward(self, data: dict) -> dict:
-        for key in self.required_data_keys:
-            assert key in data, f'Missing key {key} in data'
-        data0, data1 = data['image0'], data['image1']
-        kpts0_, kpts1_ = data0['keypoints'], data1['keypoints']
+    def _forward(self, size0, size1, kpts0_, kpts1_, desc0, desc1):
         b, m, _ = kpts0_.shape
         b, n, _ = kpts1_.shape
-        size0, size1 = data0.get('image_size'), data1.get('image_size')
-        size0 = size0 if size0 is not None else data0['image'].shape[-2:][::-1]
-        size1 = size1 if size1 is not None else data1['image'].shape[-2:][::-1]
         kpts0 = normalize_keypoints(kpts0_, size=size0)
         kpts1 = normalize_keypoints(kpts1_, size=size1)
 
         assert torch.all(kpts0 >= -1) and torch.all(kpts0 <= 1)
         assert torch.all(kpts1 >= -1) and torch.all(kpts1 <= 1)
 
-        desc0 = data0['descriptors'].detach()
-        desc1 = data1['descriptors'].detach()
+        desc0 = desc0.detach()
+        desc1 = desc1.detach()
 
         assert desc0.shape[-1] == self.conf.input_dim
         assert desc1.shape[-1] == self.conf.input_dim
@@ -415,6 +403,7 @@ class LightGlue(nn.Module):
             scores, self.conf.filter_threshold)
 
         matches, mscores = [], []
+        mkpts0, mkpts1 = [], []
         for k in range(b):
             valid = m0[k] > -1
             m_indices_0 = torch.where(valid)[0]
@@ -424,6 +413,13 @@ class LightGlue(nn.Module):
                 m_indices_1 = ind1[k, m_indices_1]
             matches.append(torch.stack([m_indices_0, m_indices_1], -1))
             mscores.append(mscores0[k][valid])
+            mkpts0.append(kpts0_[k][m_indices_0])
+            mkpts1.append(kpts1_[k][m_indices_1])
+
+        matches = torch.stack(matches, 0)
+        mscores = torch.stack(mscores, 0)
+        mkpts0 = torch.stack(mkpts0, 0)
+        mkpts1 = torch.stack(mkpts1, 0)
 
         # TODO: Remove when hloc switches to the compact format.
         if do_point_pruning:
@@ -439,18 +435,12 @@ class LightGlue(nn.Module):
             mscores1_[:, ind1] = mscores1
             m0, m1, mscores0, mscores1 = m0_, m1_, mscores0_, mscores1_
 
-        pred = {
-            'matches0': m0,
-            'matches1': m1,
-            'matching_scores0': mscores0,
-            'matching_scores1': mscores1,
-            'stop': i+1,
-            'matches': matches,
-            'scores': mscores,
-        }
-        if do_point_pruning:
-            pred.update(dict(prune0=prune0, prune1=prune1))
-        return pred
+        return MatchingResult(
+            mkpts0,
+            mkpts1,
+            matches,
+            mscores
+        )
 
     def confidence_threshold(self, layer_index: int) -> float:
         """ scaled confidence threshold """
